@@ -1,0 +1,92 @@
+name: Generate Translation Feed
+
+on:
+  push:
+    paths:
+      - 'apple-apps/**/manifest.json'
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate feed JSON
+        run: |
+          mkdir -p _site
+          cat > generate-feed.sh << 'SCRIPT'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          feed='{"generatedAt":"'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'","translations":[]}'
+
+          for manifest in $(find apple-apps -name "manifest.json" -type f | sort); do
+            # Extract path components: apple-apps/{lang}/{version}/manifest.json
+            lang=$(echo "$manifest" | cut -d'/' -f2)
+            version=$(echo "$manifest" | cut -d'/' -f3)
+
+            # Read manifest data
+            complete=$(jq -r '.complete // false' "$manifest")
+            pageCount=$(jq -r '.pageCount // 0' "$manifest")
+            generatedAt=$(jq -r '.generatedAt // ""' "$manifest")
+            platform=$(jq -r '.platform // "unknown"' "$manifest")
+
+            # Only include complete translations
+            if [ "$complete" = "true" ]; then
+              # List all .md files for this version
+              pages=$(find "apple-apps/${lang}/${version}" -name "*.md" -type f \
+                | sed "s|apple-apps/${lang}/${version}/||" \
+                | jq -R . | jq -s .)
+
+              entry=$(jq -n \
+                --arg lang "$lang" \
+                --arg version "$version" \
+                --arg platform "$platform" \
+                --argjson pageCount "$pageCount" \
+                --arg generatedAt "$generatedAt" \
+                --argjson pages "$pages" \
+                '{language: $lang, appVersion: $version, platform: $platform, pageCount: $pageCount, generatedAt: $generatedAt, pages: $pages}')
+
+              feed=$(echo "$feed" | jq --argjson entry "$entry" '.translations += [$entry]')
+            fi
+          done
+
+          echo "$feed" | jq '.' > _site/index.json
+
+          # Also generate per-language feeds
+          for lang in $(echo "$feed" | jq -r '.translations[].language' | sort -u); do
+            mkdir -p "_site/${lang}"
+            echo "$feed" | jq --arg l "$lang" '{generatedAt: .generatedAt, translations: [.translations[] | select(.language == $l)]}' > "_site/${lang}/index.json"
+          done
+
+          echo "Generated feed with $(echo "$feed" | jq '.translations | length') translation sets"
+          SCRIPT
+          chmod +x generate-feed.sh
+          bash generate-feed.sh
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
